@@ -13,7 +13,7 @@ models:
 
 containers:
   - name: "deepseek-v4-1-flash-1017-uncensored"
-    image: "ghcr.io/mapleprivacylabs/inference-deepseek-uncensored:build-required" # source template; release workflow pins a real digest
+    image: "ghcr.io/mapleprivacylabs/inference-deepseek-uncensored@sha256:f205046c2d17d4d620533480430ffc55f8356d27b6e1309b1b37e1e451bfc079" # v0.1.0-rc.1+b300
     runtime: nvidia
     gpus: all
     restart: always
