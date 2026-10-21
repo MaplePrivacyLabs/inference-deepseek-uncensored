@@ -1,0 +1,19 @@
+This repository derives its confidential-container configuration and release
+workflow structure from:
+
+  https://github.com/MaplePrivacyLabs/inference-deepseek
+  https://github.com/tinfoilsh/confidential-deepseek-v4-1-flash
+  https://github.com/tinfoilsh/update-container-action
+  https://github.com/tinfoilsh/measure-image-action
+
+The Docker image derives from Tinfoil's exact v0.0.6+b300 image digest recorded
+in Dockerfile. That image includes third-party components with their own
+license notices; this repository does not replace or expand those licenses.
+
+The model weights are published separately by Dealign AI, derived from
+DeepSeek-V4.1-Flash-1017. Consult those model repositories for weight licensing
+and provenance. No weights are distributed in this source repository.
+
+At preparation time, the upstream confidential-deepseek-v4-1-flash source
+repository did not publish a root LICENSE file. This attribution does not
+assert an additional license grant for upstream source material.

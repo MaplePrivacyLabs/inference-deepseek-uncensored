@@ -1,0 +1,4 @@
+**
+!Dockerfile
+!scripts/
+!scripts/patch_model_identity.py

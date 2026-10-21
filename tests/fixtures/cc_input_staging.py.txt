@@ -1,0 +1,183 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Private CPU staging for the measured confidential Flash text inputs."""
+
+import numpy as np
+import torch
+
+from vllm.utils.torch_utils import PIN_MEMORY, async_tensor_h2d
+
+_SUPPORTED_TENSOR_PARALLEL_SIZES = (4,)
+_SINGLE_PARTITION = 1
+_SPECULATIVE_DEPTH = 5
+_MAX_CONTEXT = 1_048_576
+_MAX_REQUESTS = 64
+_MODEL_NAME = "deepseek-v4-1-flash"
+_MIN_CUMULATIVE_ELEMENTS = 2
+_ABSENT_FEATURES = (
+    "pcp_manager",
+    "ubatch_runner",
+    "batch_sharder",
+    "fast_prefill",
+    "aux_output_connector",
+    "pooling_runner",
+    "pp_handler",
+)
+
+
+def supports_text_staging(runner, scheduler_output, batch, num_active_loras):
+    from vllm.v1.worker.gpu.ec_connector import ECConnector
+    from vllm.v1.worker.gpu.kv_connector import NO_OP_KV_CONNECTOR
+    from vllm.models.deepseek_v41.nvidia.model_state import DeepseekV41ModelState
+    from vllm.utils.platform_utils import is_uva_available
+    from vllm.v1.worker.gpu.spec_decode.adaptive_verification import AdaptiveVerificationManager
+    from vllm.v1.worker.gpu.sample.sampler import (
+        BadWordsState,
+        LogitBiasState,
+        PenaltiesState,
+        Sampler,
+    )
+    from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+
+    parallel, spec, state = (
+        runner.parallel_config,
+        runner.speculative_config,
+        runner.model_state,
+    )
+    if not (
+        all(getattr(runner, name) is None for name in _ABSENT_FEATURES)
+        and not runner.lora_config
+        and num_active_loras == 0
+        and not runner.is_pooling_model
+        and not runner.is_encoder_decoder
+        and runner.is_first_pp_rank
+        and runner.is_last_pp_rank
+        and not runner.use_pp
+        and not runner.use_dcp
+        and runner.dp_size == runner.dcp_size == _SINGLE_PARTITION
+        and parallel.tensor_parallel_size in _SUPPORTED_TENSOR_PARALLEL_SIZES
+        and all(
+            getattr(parallel, field) == _SINGLE_PARTITION
+            for field in (
+                "data_parallel_size",
+                "pipeline_parallel_size",
+                "prefill_context_parallel_size",
+                "decode_context_parallel_size",
+            )
+        )
+        and not parallel.enable_dbo
+        and not parallel.use_ubatching
+        and not parallel.enable_batch_sharded_sampling
+        and not parallel.enable_expert_parallel
+        and runner.scheduler_config.async_scheduling is True
+        and runner.max_model_len == _MAX_CONTEXT
+        and runner.max_num_reqs == _MAX_REQUESTS
+        and runner.model_config.served_model_name == _MODEL_NAME
+        and spec is not None
+        and spec.method == "dspark"
+        and spec.num_speculative_tokens == _SPECULATIVE_DEPTH
+        and runner.num_speculative_steps == _SPECULATIVE_DEPTH
+        and spec.num_speculative_tokens_per_batch_size is None
+        and (
+            (spec.enable_adaptive_verification is True
+             and type(runner.adaptive_verification) is AdaptiveVerificationManager)
+            or (spec.enable_adaptive_verification is False
+                and runner.adaptive_verification is None)
+        )
+        and spec.rejection_sample_method == "block"
+        and spec.draft_sample_method == "probabilistic"
+        and not is_uva_available()
+        and not runner.model_config.logits_processors
+        and type(runner.sampler) is Sampler
+        and tuple(type(item) for item in runner.sampler.logits_processors)
+        == (LogitBiasState, PenaltiesState, BadWordsState)
+        and type(runner.speculator) is DSparkSpeculator
+        and type(state) is DeepseekV41ModelState
+        and runner.kv_connector is NO_OP_KV_CONNECTOR
+        and type(runner.ec_connector) is ECConnector
+        and runner.speculator.target_input_buffers is runner.input_buffers
+        and runner.speculator.input_buffers is not runner.input_buffers
+        and not runner.speculator.supports_mm_inputs
+        and runner.model_config.enable_prompt_embeds is False
+        and state.prompt_embeds_state is None
+        and runner.uses_inputs_embeds is runner.supports_mm_inputs
+        and state.supports_mm_inputs is runner.supports_mm_inputs
+        and batch.num_tokens > 0
+        and batch.req_ids
+        and len(set(batch.req_ids)) == len(batch.req_ids)
+        and set(batch.req_ids) == scheduler_output.num_scheduled_tokens.keys()
+        and not scheduler_output.scheduled_encoder_inputs
+        and all(
+            not request.mm_features
+            and request.prompt_embeds is None
+            and request.prompt_is_token_ids is None
+            for request in scheduler_output.scheduled_new_reqs
+        )
+    ):
+        return False
+    if runner.supports_mm_inputs:
+        if not all(
+            runner.encoder_cache.mm_features.get(req_id) == []
+            for req_id in batch.req_ids
+        ):
+            return False
+    elif (
+        runner.encoder_cache is not None
+        or getattr(state, "encoder_runner", None) is not None
+    ):
+        return False
+    device = runner.device
+    return (
+        PIN_MEMORY
+        and device.type == "cuda"
+        and device.index is not None
+        and torch.cuda.current_device() == device.index
+        and torch.cuda.current_stream(device) == runner.main_stream
+        and not torch.cuda.is_current_stream_capturing()
+    )
+
+
+def private_tensor_h2d(data, device=None, dtype=None, out=None):
+    expected_dtype = np.dtype(np.intp if dtype is torch.int32 else np.int32)
+    minimum = 1 if dtype is torch.int32 else _MIN_CUMULATIVE_ELEMENTS
+    supported = (
+        PIN_MEMORY
+        and type(data) is np.ndarray
+        and data.ndim == 1
+        and data.size >= minimum
+        and data.dtype == expected_dtype
+        and data.dtype.isnative
+        and data.flags.c_contiguous
+        and not torch.from_numpy(data).is_pinned()
+        and not torch.cuda.is_current_stream_capturing()
+    )
+    if out is not None:
+        supported = supported and (
+            device is None
+            and dtype is None
+            and type(out) is torch.Tensor
+            and out.dtype is torch.int32
+            and out.device.type == "cuda"
+            and tuple(out.shape) == tuple(data.shape)
+            and out.is_contiguous()
+            and out.storage_offset() == 0
+        )
+    else:
+        supported = supported and (
+            type(device) is torch.device
+            and device.type == "cuda"
+            and dtype in (None, torch.int32)
+        )
+    if not supported:
+        return async_tensor_h2d(data, device=device, dtype=dtype, out=out)
+
+    if out is not None:
+        dtype = out.dtype
+    source = torch.from_numpy(data)
+    # The copy owns its source; scheduler arrays can be reused after return.
+    staged = torch.empty(
+        source.shape, dtype=dtype or source.dtype, device="cpu", pin_memory=False
+    ).copy_(source)
+    if out is not None:
+        return out.copy_(staged, non_blocking=True)
+    return staged.to(device=device, dtype=dtype, non_blocking=True)
