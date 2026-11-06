@@ -11,6 +11,11 @@ on:
         description: 'Base version without build metadata (e.g. v0.1.0-rc.1)'
         required: true
         type: string
+      reuse-image-from-release:
+        description: 'Optional published release tag whose exact image is reused for a CVM-only release'
+        required: false
+        default: ''
+        type: string
 
 concurrency:
   group: tinfoil-container-release-${{ inputs.version }}+b300
@@ -23,7 +28,7 @@ jobs:
       contents: read
       packages: write
     outputs:
-      digest: ${{ steps.build.outputs.digest }}
+      digest: ${{ steps.build.outputs.digest || steps.reuse.outputs.digest }}
       release-tag: ${{ steps.release.outputs.release-tag }}
 
     steps:
@@ -70,10 +75,54 @@ jobs:
       - name: Test bounded model identity patch
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 
+      - name: Reuse the exact image from a published configuration
+        if: ${{ inputs.reuse-image-from-release != '' }}
+        id: reuse
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          REUSE_RELEASE: ${{ inputs.reuse-image-from-release }}
+        run: |
+          git check-ref-format "refs/tags/$REUSE_RELEASE"
+          gh release view "$REUSE_RELEASE" --json isDraft --jq '.isDraft == false' | grep -qx true
+          git fetch --no-tags origin "refs/tags/$REUSE_RELEASE:refs/tags/$REUSE_RELEASE"
+          python3 - <<'PY'
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
+
+          release = os.environ["REUSE_RELEASE"]
+          ref = f"refs/tags/{release}"
+          previous = subprocess.check_output(["git", "show", f"{ref}:tinfoil-config.yml"], text=True)
+          current = Path("tinfoil-config.yml").read_text()
+          images = re.findall(r'^    image: "(ghcr\.io/mapleprivacylabs/inference-deepseek-uncensored@sha256:([0-9a-f]{64}))".*$', previous, re.M)
+          if len(images) != 1:
+              raise SystemExit("The published release must pin exactly one derivative image")
+          source_images = re.findall(r'^    image: "([^"]+)".*$', current, re.M)
+          if source_images != ["ghcr.io/mapleprivacylabs/inference-deepseek-uncensored:build-required"]:
+              raise SystemExit("The source must retain its single build-required image template")
+
+          def normalize(config):
+              without_cvm, cvm_count = re.subn(r'^cvm-version: [^\n]+\n', '', config, flags=re.M)
+              without_image, image_count = re.subn(r'^    image: [^\n]+\n', '', without_cvm, flags=re.M)
+              if (cvm_count, image_count) != (1, 1):
+                  raise SystemExit("Unexpected configuration structure")
+              return without_image
+
+          if normalize(previous) != normalize(current):
+              raise SystemExit("Image reuse permits only a CVM configuration change")
+          subprocess.run(["git", "diff", "--exit-code", ref, "HEAD", "--", "Dockerfile", "scripts", "patches"], check=True)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"digest=sha256:{images[0][1]}\n")
+          PY
+
       - name: Set up Docker Buildx
+        if: ${{ inputs.reuse-image-from-release == '' }}
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
 
       - name: Log in to GitHub Container Registry
+        if: ${{ inputs.reuse-image-from-release == '' }}
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           registry: ghcr.io
@@ -81,6 +130,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Extract metadata for Docker
+        if: ${{ inputs.reuse-image-from-release == '' }}
         id: meta
         uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
         with:
@@ -92,6 +142,7 @@ jobs:
             org.opencontainers.image.version=${{ steps.release.outputs.release-tag }}
 
       - name: Build and push Docker image
+        if: ${{ inputs.reuse-image-from-release == '' }}
         id: build
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         env:

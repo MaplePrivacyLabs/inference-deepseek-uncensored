@@ -63,6 +63,13 @@ Publishing does not deploy a container or promote GitHub's latest release.
 Do not run the publish workflow on a source branch. Existing release tags
 cannot be reused; issue a new version for changes.
 
+For a **CVM-only configuration release**, supply `reuse-image-from-release`
+with the exact tag of an existing published release. The workflow verifies that
+the model, authentication, resources, serving configuration and runtime sources
+are unchanged, then reuses that release's image digest without building or
+publishing another image. It uses the same immutable-tag and measurement phases.
+Leave the input empty for the normal image-build release path.
+
 **First package publication:** ensure the repository and resulting GHCR package
 are public. New GHCR packages may initially be private even when their source
 repository is public. Set the package visibility explicitly and verify an
